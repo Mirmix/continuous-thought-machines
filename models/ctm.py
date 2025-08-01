@@ -97,6 +97,9 @@ class ContinuousThoughtMachine(nn.Module):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
+                 use_neuron_normalization=False,  # New parameter for neuron-level normalization
+                 normalization_decay=0.01,  # Decay factor for running statistics
+                 normalization_epsilon=1e-5,  # Epsilon for numerical stability
                  ):
         super(ContinuousThoughtMachine, self).__init__()
 
@@ -114,6 +117,11 @@ class ContinuousThoughtMachine(nn.Module):
         self.neuron_select_type = neuron_select_type
         self.memory_length = memory_length
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
+        
+        # --- Neuron Normalization Parameters ---
+        self.use_neuron_normalization = use_neuron_normalization
+        self.normalization_decay = normalization_decay
+        self.normalization_epsilon = normalization_epsilon
 
         # --- Assertions ---
         self.verify_args()
@@ -134,6 +142,13 @@ class ContinuousThoughtMachine(nn.Module):
         #  --- Start States ---
         self.register_parameter('start_activated_state', nn.Parameter(torch.zeros((d_model)).uniform_(-math.sqrt(1/(d_model)), math.sqrt(1/(d_model)))))
         self.register_parameter('start_trace', nn.Parameter(torch.zeros((d_model, memory_length)).uniform_(-math.sqrt(1/(d_model+memory_length)), math.sqrt(1/(d_model+memory_length)))))
+
+        # --- Neuron Normalization Buffers ---
+        if self.use_neuron_normalization:
+            # Register buffers for running mean and variance per neuron
+            self.register_buffer('running_mean', torch.zeros(d_model))
+            self.register_buffer('running_var', torch.ones(d_model))
+            self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
         # --- Synchronisation ---
         self.neuron_select_type_out, self.neuron_select_type_action = self.get_neuron_select_type()
@@ -242,6 +257,65 @@ class ContinuousThoughtMachine(nn.Module):
         ne = compute_normalized_entropy(reshaped_pred)
         current_certainty = torch.stack((ne, 1-ne), -1)
         return current_certainty
+
+    def normalize_activations(self, activated_state, state_trace=None):
+        """
+        Apply neuron-level normalization to post-activations based on trace history.
+        
+        This implements biologically-inspired normalization where each neuron's activation
+        is normalized using statistics computed from its trace history.
+        
+        Args:
+            activated_state (torch.Tensor): Post-activations of shape (B, d_model)
+            state_trace (torch.Tensor): Pre-activation trace history of shape (B, d_model, memory_length)
+            
+        Returns:
+            torch.Tensor: Normalized activations of same shape
+        """
+        if not self.use_neuron_normalization:
+            return activated_state
+            
+        # activated_state shape: (B, d_model)
+        B, d_model = activated_state.shape
+        
+        if state_trace is not None and state_trace.size(-1) > 0:
+            # Use trace-based normalization
+            # Compute statistics from the trace history for each neuron
+            # state_trace shape: (B, d_model, memory_length)
+            
+            # Compute mean and variance across the trace dimension for each neuron
+            trace_mean = state_trace.mean(dim=-1)  # Shape: (B, d_model)
+            trace_var = state_trace.var(dim=-1, unbiased=False)  # Shape: (B, d_model)
+            
+            # Normalize using trace statistics
+            # Formula: ẑ_i^t = (z_i^t - μ_i^trace) / √(σ_i^2^trace + ε)
+            normalized_state = (activated_state - trace_mean) / torch.sqrt(trace_var + self.normalization_epsilon)
+            
+        else:
+            # Fallback to batch-based normalization (original method)
+            if self.training:
+                # Compute current batch statistics per neuron
+                batch_mean = activated_state.mean(dim=0)  # Shape: (d_model,)
+                batch_var = activated_state.var(dim=0, unbiased=False)  # Shape: (d_model,)
+                
+                # Update running statistics using exponential moving average
+                if self.num_batches_tracked == 0:
+                    # First batch: initialize with batch statistics
+                    self.running_mean = batch_mean.detach()
+                    self.running_var = batch_var.detach()
+                else:
+                    # Update using decay factor α = 0.01
+                    alpha = self.normalization_decay
+                    self.running_mean = ((1 - alpha) * self.running_mean + alpha * batch_mean).detach()
+                    self.running_var = ((1 - alpha) * self.running_var + alpha * batch_var).detach()
+                
+                self.num_batches_tracked += 1
+            
+            # Normalize using running statistics
+            # Formula: ẑ_i^t = (z_i^t - μ_i) / √(σ_i^2 + ε)
+            normalized_state = (activated_state - self.running_mean.unsqueeze(0)) / torch.sqrt(self.running_var.unsqueeze(0) + self.normalization_epsilon)
+        
+        return normalized_state
 
     # --- Setup Methods ---
 
@@ -494,6 +568,9 @@ class ContinuousThoughtMachine(nn.Module):
         state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1) # Shape: (B, H, T)
         activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1) # Shape: (B, H)
 
+        # --- Apply Initial Neuron-Level Normalization ---
+        activated_state = self.normalize_activations(activated_state, state_trace)
+
         # --- Prepare Storage for Outputs per Iteration ---
         predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
         certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
@@ -530,6 +607,9 @@ class ContinuousThoughtMachine(nn.Module):
             # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
             # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
             # done using only the currect activated state (see compute_synchronisation method for explanation)
+
+            # --- Apply Neuron-Level Normalization ---
+            activated_state = self.normalize_activations(activated_state, state_trace)
 
             # --- Calculate Synchronisation for Output Predictions ---
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
